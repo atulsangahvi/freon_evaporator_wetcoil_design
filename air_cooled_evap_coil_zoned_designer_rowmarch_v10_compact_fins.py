@@ -149,6 +149,8 @@ def airside_compact_htc_dp(mdot_air, face_W, face_H, depth, fin_pitch, tf,
                            fin_type: str = "Wavy (no louvers)",
                            louver_angle_deg: float = 27.0,
                            louver_cuts_per_row: int = 8,
+                           louver_pitch_m: float = None,
+                           louver_length_m: float = None,
                            h_mult_wavy: float = 1.15,
                            dp_mult_wavy: float = 1.20):
     """
