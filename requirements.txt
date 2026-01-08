@@ -1,0 +1,10 @@
+streamlit>=1.30
+pandas>=2.1
+openpyxl>=3.1
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=5.1
+rapidfuzz>=3.5
+numpy>=1.26
+CoolProp>=6.6
+reportlab>=4.0
