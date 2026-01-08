@@ -284,44 +284,6 @@ def h_i_boiling_shah_like(mdot, x, rho_l, mu_l, k_l, cp_l, D, enhancement=1.8):
     return h_tp, Re_l, Pr_l, v_l
 
 # ---------------- Row-by-row marching ----------------
-
-def dewpoint_C_from_T_W(T_C: float, W: float, P: float = P_ATM) -> float:
-    """Invert W(T, RH=100%) to get dewpoint for given humidity ratio."""
-    # Wsat(T) is monotonic increasing in typical HVAC range.
-    lo, hi = -40.0, 60.0
-    for _ in range(60):
-        mid = 0.5*(lo+hi)
-        Wsat = W_from_T_RH(mid, 100.0, P)
-        if Wsat >= W:
-            hi = mid
-        else:
-            lo = mid
-    return 0.5*(lo+hi)
-
-def T_from_h_W(h_J_per_kg_da: float, W: float) -> float:
-    """Solve moist air enthalpy equation for T (°C) given h (J/kg_dry_air) and W."""
-    # h = 1000*1.006*T + W*(H_LV0 + 1000*1.86*T)
-    denom = 1000.0*(1.006 + 1.86*W)
-    if denom <= 0:
-        return 0.0
-    return (h_J_per_kg_da - W*H_LV0)/denom
-
-def bf_from_Q_const_sink(Q: float, C_air: float, driving: float) -> float:
-    """
-    For a constant-sink element with bypass-factor form:
-      Q = C_air*(1-BF)*driving
-    => BF = 1 - Q/(C_air*driving)
-    """
-    if C_air <= 0 or driving <= 0:
-        return 1.0
-    return max(0.0, min(1.0, 1.0 - Q/max(C_air*driving, 1e-12)))
-
-def UA_from_BF(BF: float, C_air: float) -> float:
-    """UA = NTU*C_air; BF = exp(-NTU) => UA = -ln(BF)*C_air."""
-    BF = max(min(BF, 0.999999999), 1e-12)
-    return (-math.log(BF))*C_air
-
-# ---------------- Row-by-row marching ----------------
 def simulate_evaporator(
     face_W, face_H, Nr, St, Sl, Do, tw, tf, FPI,
     fin_k, tube_k, circuits,
@@ -331,28 +293,10 @@ def simulate_evaporator(
     fluid, Tsat_C, SH_req_K, mdot_ref_total, x_in,
     wet_enh=1.35, Rfo=0.0, Rfi=0.0
 ):
-    """
-    Row marching with partial-row zoning.
-
-    IMPORTANT (corrected): the incoming air first encounters the refrigerant outlet-side
-    *superheat* zone, and only afterwards the evaporating (2φ) zone. This is the usual
-    HVAC evaporator arrangement when air and refrigerant are counterflowed to ensure
-    sufficient superheat.
-
-    Zoning implemented (in this order along air flow):
-      1) Superheat (SH): T_ref decreases from Tsat+SH_req -> Tsat (because we march opposite refrigerant flow)
-      2) Evaporation (2φ): quality x decreases from 1.0 -> x_in (same reason)
-
-    Each row can be split into partial segments so a zone can finish mid-row and the next zone can begin
-    within the same physical row.
-
-    Each row can be split into partial segments so a zone can finish mid-row and the next zone can begin
-    within the same physical row.
-    """
     if not HAS_CP:
         raise RuntimeError("CoolProp missing. Add CoolProp>=6.6 to requirements.txt.")
 
-    # ---- Air mass flow (dry-air basis) ----
+    # Air mass flow (dry-air basis)
     rho_in = rho_moist_kg_m3(Tdb_in, W_in)
     mdot_air_total = rho_in*Vdot_m3_s
     mdot_da = mdot_air_total/(1.0+W_in)
@@ -361,35 +305,36 @@ def simulate_evaporator(
     h_req_out = h_moist_J_per_kg_da(Tdb_req, W_req)
     Q_required = mdot_da*(h_in - h_req_out)
 
-    # ---- Geometry ----
+    # Geometry
     geom = geometry_areas(face_W, face_H, Nr, St, Do, tf, FPI, Sl=Sl)
     Ao = geom["Ao"]; Arow = geom["Arow"]; Amin = geom["Amin"]
     tubes_per_row = geom["tubes_per_row"]
     L_tube = geom["L_tube"]
 
-    # ---- Air properties (for cp) ----
+    # Air properties (use inlet for correlations)
+    mu_a = mu_air_Pas(Tdb_in)
+    k_a  = k_air_W_mK(Tdb_in)
     cp_a = cp_moist_J_per_kgK(Tdb_in, W_in)
+    Pr_a = cp_a*mu_a/max(k_a,1e-12)
 
-    # ---- Air-side h (dry baseline), dp, fin efficiency ----
-    h_air_dry, dp_air, air_meta = airside_compact_htc_dp(
-        mdot_air_total, face_W, face_H, geom.get('depth', Nr*St), geom['fin_pitch'], tf,
-        Tdb_in, W_in, P_ATM,
-        fin_type=fin_type,
-        louver_angle_deg=louver_angle_deg,
-        louver_cuts_per_row=louver_cuts_per_row,
-        h_mult_wavy=h_mult_wavy,
-        dp_mult_wavy=dp_mult_wavy
-    )
+    # Air-side h, fin efficiency, eta_o
+    h_air_dry, dp_air, air_meta = airside_compact_htc_dp(mdot_air_total, face_W, face_H, geom.get('depth', Nr*St), geom['fin_pitch'], tf,
+                                               Tdb_in, W_in, P_ATM,
+                                               fin_type=fin_type,
+                                               louver_angle_deg=louver_angle_deg,
+                                               louver_cuts_per_row=louver_cuts_per_row,
+                                               h_mult_wavy=h_mult_wavy,
+                                               dp_mult_wavy=dp_mult_wavy)
     h_air_wet = h_air_dry*wet_enh
 
-    # fin efficiencies
+    # fin efficiency uses wet h for wet rows; we compute both and use per-row regime
     Lc = max(0.5*(min(St, Sl) - Do), 1e-6)
     eta_f_dry = fin_efficiency(h_air_dry, fin_k, tf, Lc)
     eta_o_dry = 1.0 - (geom["A_fin"]/max(Ao,1e-12))*(1.0-eta_f_dry)
     eta_f_wet = fin_efficiency(h_air_wet, fin_k, tf, Lc)
     eta_o_wet = 1.0 - (geom["A_fin"]/max(Ao,1e-12))*(1.0-eta_f_wet)
 
-    # ---- Tube geometry & Uo helper ----
+    # Tube geometry
     Di = max(Do - 2.0*tw, 1e-5)
     Ao_per_m = pi*Do
     Ai_per_m = pi*Di
@@ -400,7 +345,7 @@ def simulate_evaporator(
         invU = (1.0/max(eta_o*h_o,1e-12)) + Rfo + Ao_Ai*((1.0/max(h_i,1e-12))+Rfi) + R_wall_per_Ao
         return 1.0/max(invU,1e-12)
 
-    # ---- Refrigerant saturation properties ----
+    # Refrigerant saturation properties
     TsK = K(Tsat_C)
     P_sat = PropsSI("P","T",TsK,"Q",0,fluid)
     rho_l = PropsSI("D","T",TsK,"Q",0,fluid)
@@ -413,49 +358,42 @@ def simulate_evaporator(
     k_v   = PropsSI("L","T",TsK,"Q",1,fluid)
     h_fg  = PropsSI("H","T",TsK,"Q",1,fluid) - PropsSI("H","T",TsK,"Q",0,fluid)
 
-    # ---- Refrigerant flow per circuit & per-row length per circuit ----
+    # Refrigerant flow per circuit and per-tube segment length per row per circuit
     mdot_ref_total = max(mdot_ref_total, 1e-9)
     circuits = max(int(circuits), 1)
     mdot_ref_c = mdot_ref_total/circuits
+    # approximate total tube length per circuit across all rows
     L_total_circ = (tubes_per_row*Nr/circuits)*L_tube
-    L_row_circ = L_total_circ/max(Nr,1)
+    L_row_circ = L_total_circ/max(Nr,1)  # average length per row per circuit
 
-    # ---- Marching state ----
-    # Air marches forward
+    # Marching state (start at air inlet side where refrigerant is OUTLET: superheated by SH_req)
+    # We march "backward" along refrigerant flow: from outlet -> inlet.
+    T_ref = Tsat_C + SH_req_K
+    x = None  # None indicates superheated vapor; once at Tsat, we switch to two-phase with quality x starting at 1.
+    SH_ach = 0.0
+
+    # Air state marching along air direction
     T_air = Tdb_in
     W_air = W_in
-    h_air = h_in
+    h_air = h_moist_J_per_kg_da(T_air, W_air)
 
-    # Refrigerant is marched *opposite* its physical flow direction so that the air-path sees
-# SH first, then 2φ (counterflow-style ordering along the air path).
-# We start from the refrigerant outlet condition (superheated vapor) and march toward inlet quality.
-zone = "SH"
-x_target_in = max(0.0, min(0.9999, x_in))
-x = 1.0  # at outlet-side (end of 2φ zone) quality is ~1 before superheat
-T_ref = Tsat_C + SH_req_K
-
-
-    # helpers for saturated air at a given surface temp
-def sat_props_at_Ts(Ts_C: float):
-    W_s = W_from_T_RH(Ts_C, 100.0)
-    h_s = h_moist_J_per_kg_da(Ts_C, W_s)
-    return W_s, h_s
+    # Useful saturation enthalpy at coil surface Tsat
+    W_sat = W_from_T_RH(Tsat_C, 100.0)
+    h_sat = h_moist_J_per_kg_da(Tsat_C, W_sat)
 
     rows_log = []
     Q_total = 0.0
-
-    # ---- Refrigerant pressure drop (rough) ----
     dp_ref_total = 0.0
     dp_ref_SH = 0.0
     dp_ref_2p = 0.0
 
-    # ---- Air-side pressure drop (same as previous one-shot model) ----
+    # Air-side pressure drop (simple sum per row: use face velocity and core velocity model similar to your condenser)
     v_face = Vdot_m3_s/max(geom["face_area"],1e-9)
+    # crude fin-channel model
     fin_pitch = geom.get("fin_pitch", geom.get("s"))
     s_fin = max(1e-6, fin_pitch - tf)
     D_h = 2.0*s_fin
     v_core = v_face*(geom["face_area"]/Amin)
-    mu_a = mu_air_Pas(Tdb_in)
     Re_ch = rho_in*v_core*D_h/max(mu_a,1e-12)
     q_dyn = 0.5*rho_in*v_core*v_core
     if Re_ch < 2300:
@@ -464,182 +402,182 @@ def sat_props_at_Ts(Ts_C: float):
         fD = 0.3164/(Re_ch**0.25)
     L_flow = geom.get('depth', Nr*St)
     dp_air = fD*(L_flow/max(D_h,1e-12))*q_dyn + (0.5+1.0)*q_dyn  # inlet+outlet
+    # This dp_air is one-shot; used as reported value.
 
-    # ---- Core row-march with partial-row splitting ----
+    def eps_crossflow_Cmin_Cmax(NTU, Cr):
+        # Kays & London: crossflow both unmixed approximation
+        Cr = max(min(Cr, 0.999999), 1e-9)
+        return 1.0 - math.exp((math.exp(-Cr*NTU)-1.0)/Cr)
+
     for row in range(1, Nr+1):
-        UA_row = None  # will compute per segment because h_i changes with zone
-        UA_remaining = 1.0  # fraction of row UA available for additional segments
-        row_Q = 0.0
-        row_Q_2p = 0.0
-        row_Q_SH = 0.0
-        seg = 0
+        # Determine regime for this row based on refrigerant state at this location
+        # Compute row UA depending on dry/wet and inside h
+        if x is None:
+            # Superheated vapor sensible (mostly dry fins here)
+            # inside h (vapor)
+            h_i, Re_i, Pr_i, v_i = h_i_dittus_boelter(mdot_ref_c, rho_v, mu_v, k_v, cp_v, Di)
+            U = Uo(h_i, h_air_dry, eta_o_dry)
+            UA = U*Arow
+            # ε–NTU (two fluids)
+            C_air = mdot_da*cp_a
+            C_ref = mdot_ref_total*cp_v
+            Cmin = min(C_air, C_ref); Cmax = max(C_air, C_ref)
+            Cr = Cmin/max(Cmax,1e-12)
+            NTU = UA/max(Cmin,1e-12)
+            eps = eps_crossflow_Cmin_Cmax(NTU, Cr)
+            dT_in = max(T_air - T_ref, 0.1)  # hot air to colder ref
+            Q_row_max = eps*Cmin*dT_in
 
-        # allow multiple zone segments inside same row
-        while UA_remaining > 1e-6 and Q_total < Q_required - 1e-9:
-            seg += 1
+            # how much heat needed to bring vapor to Tsat?
+            Q_to_Tsat = mdot_ref_total*cp_v*max(T_ref - Tsat_C, 0.0)
+            if Q_row_max >= Q_to_Tsat and Q_to_Tsat > 0:
+                # partial row for SH completion
+                frac = min(Q_to_Tsat/max(Q_row_max,1e-12), 1.0)
+                Q_sh = Q_to_Tsat
+                # update air sensibly by fraction
+                T_air = T_air - Q_sh/max(C_air,1e-12)
+                h_air = h_moist_J_per_kg_da(T_air, W_air)  # W constant in dry
+                Q_total += Q_sh
+                # refrigerant reaches Tsat and enters 2φ boundary (x=1)
+                T_ref = Tsat_C
+                SH_ach = SH_req_K
+                x = 1.0
 
-            # --- determine local surface temperature proxy ---
-            if zone == "2φ":
-                Ts_surf = Tsat_C
-            else:
-                # SH (or DONE) segment surface proxy
-                Ts_surf = T_ref  # simple proxy for SH segment surface
+                # remaining fraction goes to 2φ wet enthalpy method
+                frac_rem = 1.0 - frac
+                if frac_rem > 1e-6:
+                    # treat remaining UA proportionally
+                    UA2 = UA*frac_rem
+                    NTU_h = UA2/max(mdot_da*cp_a,1e-12)
+                    BF = math.exp(-NTU_h)
+                    h_out = h_sat + BF*(h_air - h_sat)
+                    Q_2p = mdot_da*(h_air - h_out)
+                    # cap by remaining evaporation potential to reach x_in at coil inlet (end of march)
+                    Q_2p_cap = mdot_ref_total*h_fg*max(0.0, x - x_in)
+                    Q_2p = min(Q_2p, Q_2p_cap)
+                    # cap by remaining required load
+                    Q_rem = max(0.0, Q_required - Q_total)
+                    Q_2p = min(Q_2p, Q_rem)
+                    # update air enthalpy and state (assume leaves on straight line to saturated at Tsat)
+                    h_air = h_air - Q_2p/max(mdot_da,1e-12)
+                    # compute leaving air by mixing to (Tsat, sat) as ADP point:
+                    # h = h_sat + BF*(h_in - h_sat) already gives correct h; derive W via line to saturation:
+                    # We assume coil leaving approaches saturated at Tsat; find W such that h(T_air, W) = h_air with T_air >= Tsat.
+                    # Approx: assume T_air = max(Tsat, previous sensible drop). Use iterative on W at this T.
+                    T_air = max(Tsat_C, T_air - (Q_2p/max(mdot_da*cp_a,1e-12)))
+                    # derive W from enthalpy at T_air
+                    W_guess = max(0.0, (h_air - 1000*1.006*T_air)/(H_LV0 + 1000*1.86*T_air))
+                    W_air = min(W_guess, W_from_T_RH(T_air,100.0))
+                    Q_total += Q_2p
+                    # update quality backward
+                    x = max(x_in, x - Q_2p/max(mdot_ref_total*h_fg,1e-12))
 
-            # --- wet/dry decision based on dew point ---
-            Tdp = dewpoint_C_from_T_W(T_air, W_air)
-            is_wet = (Ts_surf < Tdp - 1e-6)
-
-            h_o = h_air_wet if is_wet else h_air_dry
-            eta_o = eta_o_wet if is_wet else eta_o_dry
-
-            # --- inside HTC and Uo ---
-            if zone == "2φ":
-                h_i, Re_i, Pr_i, v_i = h_i_boiling_shah_like(mdot_ref_c, x, rho_l, mu_l, k_l, cp_l, Di, enhancement=1.8)
-                # mixture props for dp
-                rho_m, mu_m = mix_props_homog(max(min(x,0.999),0.001), rho_v, rho_l, mu_v, mu_l)
-                v_ref_seg = mdot_ref_c/(rho_m*(pi*Di*Di/4.0))
-            else:
-                h_i, Re_i, Pr_i, v_i = h_i_dittus_boelter(mdot_ref_c, rho_v, mu_v, k_v, cp_v, Di)
-                v_ref_seg = v_i
-
-            U = Uo(h_i, h_o, eta_o)
-            UA_full = U*Arow
-            UA_seg_avail = UA_full*UA_remaining
-
-            # --- compute full-segment air-side leaving state using BF model ---
-            C_air = mdot_da*cp_moist_J_per_kgK(T_air, W_air)
-
-            if is_wet:
-                W_s, h_s = sat_props_at_Ts(Ts_surf)
-                BF = math.exp(-UA_seg_avail/max(C_air,1e-12))
-                h_out_full = h_s + BF*(h_air - h_s)
-                W_out_full = W_s + BF*(W_air - W_s)
-                T_out_full = T_from_h_W(h_out_full, W_out_full)
-                # clamp to saturation
-                W_out_full = min(W_out_full, W_from_T_RH(T_out_full, 100.0))
-                Q_full = mdot_da*(h_air - h_out_full)
-                driving = max(h_air - h_s, 1e-9)
-                # for partial UA solve we use enthalpy driving
-                def apply_BF(BF_eff):
-                    h_out = h_s + BF_eff*(h_air - h_s)
-                    W_out = W_s + BF_eff*(W_air - W_s)
-                    T_out = T_from_h_W(h_out, W_out)
-                    W_out = min(W_out, W_from_T_RH(T_out, 100.0))
-                    return T_out, W_out, h_out
-            else:
-                BF = math.exp(-UA_seg_avail/max(C_air,1e-12))
-                T_out_full = Ts_surf + BF*(T_air - Ts_surf)
-                W_out_full = W_air
-                h_out_full = h_moist_J_per_kg_da(T_out_full, W_out_full)
-                Q_full = mdot_da*cp_moist_J_per_kgK(T_air, W_air)*(T_air - T_out_full)
-                driving = max(T_air - Ts_surf, 1e-9)
-                def apply_BF(BF_eff):
-                    T_out = Ts_surf + BF_eff*(T_air - Ts_surf)
-                    W_out = W_air
-                    h_out = h_moist_J_per_kg_da(T_out, W_out)
-                    return T_out, W_out, h_out
-
-            # --- limit by remaining refrigerant-zone duty ---
-            if zone == "SH":
-                # marching opposite ref flow: remove superheat down to Tsat
-                Q_zone_need = mdot_ref_total*cp_v*max(0.0, T_ref - Tsat_C)
-            elif zone == "2φ":
-                # marching opposite ref flow: reduce quality down to inlet target x_in
-                Q_zone_need = mdot_ref_total*h_fg*max(0.0, x - x_target_in)
-            else:
-                Q_zone_need = 0.0
-
-            Q_rem = max(0.0, Q_required - Q_total)
-            Q_take = min(Q_full, Q_zone_need, Q_rem)
-
-            # If refrigerant-side zone is exhausted, stop segmenting to avoid infinite loops
-            if Q_take <= 1e-12:
-                break
-
-            # --- if we don't take the full Q, compute effective BF and UA fraction used ---
-            if Q_take < Q_full - 1e-9:
-                BF_eff = bf_from_Q_const_sink(Q_take, C_air, driving)
-                UA_eff = UA_from_BF(BF_eff, C_air)
-                frac_used = min(1.0, UA_eff/max(UA_seg_avail,1e-12))
-                T_air_out, W_air_out, h_air_out = apply_BF(BF_eff)
-            else:
-                frac_used = 1.0
-                T_air_out, W_air_out, h_air_out = T_out_full, W_out_full, h_out_full
-
-            # update air
-            T_air, W_air, h_air = T_air_out, W_air_out, h_air_out
-
-            # update totals
-            Q_total += Q_take
-            row_Q += Q_take
-            if zone == "2φ":
-                row_Q_2p += Q_take
-            else:
-                row_Q_SH += Q_take
-
-            # update refrigerant (marched opposite to physical ref flow)
-            if zone == "SH":
-                T_new = T_ref - Q_take/max(mdot_ref_total*cp_v, 1e-12)
-                if T_new <= Tsat_C + 1e-9:
-                    # superheat finished within this segment; enter 2φ zone for remaining UA
-                    T_ref = Tsat_C
-                    zone = "2φ"
-                    x = 1.0
-                else:
-                    T_ref = T_new
-            elif zone == "2φ":
-                x_new = x - Q_take/max(mdot_ref_total*h_fg, 1e-12)
-                if x_new <= x_target_in + 1e-9:
-                    # reached inlet condition; no more refrigerant-side capacity beyond this boundary
-                    x = x_target_in
-                    zone = "DONE"
-                else:
-                    x = x_new
-            else:
-                # DONE: no more ref-side duty available
-                pass
-
-            # refrigerant dp: allocate by UA fraction used as proxy for length fraction
-            L_seg = L_row_circ * (UA_remaining*frac_used)
-            if zone == "2φ":
-                rho_m, mu_m = mix_props_homog(max(min(x,0.999),0.001), rho_v, rho_l, mu_v, mu_l)
-                dp, Re_d, f, v = dp_darcy(mdot_ref_c, rho_m, mu_m, Di, L_seg)
-                dp_ref_total += dp; dp_ref_2p += dp
-            else:
-                dp, Re_d, f, v = dp_darcy(mdot_ref_c, rho_v, mu_v, Di, L_seg)
+                # Δp for SH portion (use length fraction)
+                dp, Re_d, f, v = dp_darcy(mdot_ref_c, rho_v, mu_v, Di, L_row_circ*frac)
                 dp_ref_total += dp; dp_ref_SH += dp
 
-            # reduce remaining UA fraction
-            UA_remaining *= (1.0 - frac_used)
+                rows_log.append(dict(
+                    row=row, regime="SH→2φ", UA=UA, NTU=NTU, eps=eps,
+                    Q_row_kW=(Q_sh + (Q_2p if "Q_2p" in locals() else 0.0))/1000.0,
+                    Q_SH_kW=(Q_sh)/1000.0,
+                    Q_2p_kW=((Q_2p if "Q_2p" in locals() else 0.0))/1000.0,
+                    frac_SH=frac,
+                    frac_2p=1.0-frac,
+                    T_air_out=T_air, W_air_out=W_air,
+                    T_ref=T_ref, x=x, frac_used=1.0, Re_i=Re_i, v_ref=v_i
+                ))
+                if Q_total >= Q_required - 1e-6:
+                    break
+            else:
+                # fully superheat row (or no SH needed)
+                Q = Q_row_max
+                # cap by remaining required load (so we predict required leaving air / rows-needed)
+                Q_rem = max(0.0, Q_required - Q_total)
+                Q = min(Q, Q_rem)
+                T_air = T_air - Q/max(C_air,1e-12)
+                h_air = h_moist_J_per_kg_da(T_air, W_air)
+                Q_total += Q
+                # update refrigerant temp backward
+                dT_ref = Q/max(mdot_ref_total*cp_v,1e-12)
+                T_ref = max(Tsat_C, T_ref - dT_ref)
+                SH_ach = max(0.0, T_ref - Tsat_C)
+
+                dp, Re_d, f, v = dp_darcy(mdot_ref_c, rho_v, mu_v, Di, L_row_circ)
+                dp_ref_total += dp; dp_ref_SH += dp
+
+                rows_log.append(dict(
+                    row=row, regime="SH", UA=UA, NTU=NTU, eps=eps,
+                    Q_row_kW=Q/1000.0,
+                    Q_SH_kW=Q/1000.0,
+                    Q_2p_kW=0.0,
+                    frac_SH=1.0,
+                    frac_2p=0.0,
+                    T_air_out=T_air, W_air_out=W_air,
+                    T_ref=T_ref, x=None, frac_used=1.0, Re_i=Re_i, v_ref=v_i
+                ))
+                if Q_total >= Q_required - 1e-6:
+                    break
+        else:
+            # Two-phase evaporation (wet coil enthalpy method)
+            # inside h: boiling
+            h_i, Re_i, Pr_i, v_i = h_i_boiling_shah_like(mdot_ref_c, x, rho_l, mu_l, k_l, cp_l, Di, enhancement=1.8)
+            U = Uo(h_i, h_air_wet, eta_o_wet)
+            UA = U*Arow
+
+            NTU_h = UA/max(mdot_da*cp_a,1e-12)
+            BF = math.exp(-NTU_h)
+            h_out = h_sat + BF*(h_air - h_sat)
+            Q = mdot_da*(h_air - h_out)
+
+            # cap by remaining evap capacity to reach x_in
+            Q_cap = mdot_ref_total*h_fg*max(0.0, x - x_in)
+            Q = min(Q, Q_cap)
+            # cap by remaining required load
+            Q_rem = max(0.0, Q_required - Q_total)
+            Q = min(Q, Q_rem)
+
+            # update air state using bypass-factor line to saturation at Tsat
+            T_in_row = T_air
+            W_in_row = W_air
+            T_out_row = Tsat_C + BF*(T_in_row - Tsat_C)
+            W_out_row = W_sat + BF*(W_in_row - W_sat)
+            h_out_row = h_moist_J_per_kg_da(T_out_row, W_out_row)
+            Q_uncap = mdot_da*(h_air - h_out_row)
+            if Q_uncap > Q + 1e-9:
+                fracQ = max(0.0, min(1.0, Q/max(Q_uncap,1e-12)))
+                BF_eff = 1.0 - (1.0-BF)*fracQ
+                T_out_row = Tsat_C + BF_eff*(T_in_row - Tsat_C)
+                W_out_row = W_sat + BF_eff*(W_in_row - W_sat)
+                h_out_row = h_moist_J_per_kg_da(T_out_row, W_out_row)
+            T_air = max(Tsat_C, T_out_row)
+            W_air = max(0.0, min(W_out_row, W_from_T_RH(T_air,100.0)))
+            h_air = h_moist_J_per_kg_da(T_air, W_air)
+
+            Q_total += Q
+            # update quality backward
+            x = max(x_in, x - Q/max(mdot_ref_total*h_fg,1e-12))
+
+            # Δp two-phase (homogeneous at local x~avg)
+            rho_m, mu_m = mix_props_homog(max(min(x,0.999),0.001), rho_v, rho_l, mu_v, mu_l)
+            dp, Re_d, f, v = dp_darcy(mdot_ref_c, rho_m, mu_m, Di, L_row_circ)
+            dp_ref_total += dp; dp_ref_2p += dp
 
             rows_log.append(dict(
-                row=row,
-                seg=seg,
-                regime=("2φ" if (zone=="2φ" or (zone=="SH" and row_Q_2p>0 and row_Q_SH==0 and x<1.0)) else "SH"),
-                zone_at_start=("2φ" if (row_Q_SH==0 and seg==1 and x_in<1.0) else ""),
-                wet=is_wet,
-                Ts_surf=Ts_surf,
-                Tdp_in=Tdp,
-                UA_row=UA_full,
-                UA_used=UA_seg_avail*frac_used,
-                frac_used=frac_used,
-                Q_kW=Q_take/1000.0,
-                Q_row_2p_kW=row_Q_2p/1000.0,
-                Q_row_SH_kW=row_Q_SH/1000.0,
-                T_air_out=T_air,
-                W_air_out=W_air,
-                T_ref=T_ref,
-                x=(x if zone=="2φ" else None),
-                Re_i=Re_i,
-                v_ref=v_ref_seg
+                row=row, regime="2φ", UA=UA, NTU=None, eps=None,
+                Q_row_kW=Q/1000.0,
+                Q_SH_kW=0.0,
+                Q_2p_kW=Q/1000.0,
+                frac_SH=0.0,
+                frac_2p=1.0,
+                T_air_out=T_air, W_air_out=W_air,
+                T_ref=Tsat_C, x=x, frac_used=1.0, Re_i=Re_i, v_ref=mdot_ref_c/(rho_m*(pi*Di*Di/4.0))
             ))
-
-            # stop if SH target achieved
-            if zone == "SH" and T_ref >= Tsat_C + SH_req_K - 1e-6:
+            if Q_total >= Q_required - 1e-6:
                 break
 
-        # if full duty achieved, stop
-        if Q_total >= Q_required - 1e-6:
+        # if quality has reached x_in, remaining rows (towards coil inlet) would be "not used"
+        if x is not None and x <= x_in + 1e-9:
+            # remaining rows do almost nothing (refrigerant at inlet condition) – break out
             break
 
     # Final achieved air condition
@@ -648,33 +586,33 @@ def sat_props_at_Ts(Ts_C: float):
     RH_out = RH_from_T_W(T_out, W_out)
     WB_out = wb_from_T_W(T_out, W_out)
 
-    # Achieved SH
-    SH_ach = 0.0
-    if zone == "SH":
+    # Achieved superheat at refrigerant outlet (row 1 location) is SH_req unless coil couldn't supply it.
+    # In our backward marching, if we never reached Tsat within available rows, SH_ach < SH_req.
+    if x is None:
         SH_ach = max(0.0, T_ref - Tsat_C)
-    else:
-        SH_ach = 0.0
 
+    Q_ach = Q_total
     insuff = []
-    if Q_total + 1e-6 < Q_required:
+    if Q_ach + 1e-6 < Q_required:
         insuff.append("Capacity shortfall")
     if SH_ach + 1e-6 < SH_req_K:
         insuff.append("Superheat shortfall")
 
     summary = {
         "Q_required_kW": Q_required/1000.0,
-        "Q_achieved_kW": Q_total/1000.0,
-        "Q_sensible_est_kW": (mdot_da*cp_moist_J_per_kgK(Tdb_in, W_in)*(Tdb_in - T_out))/1000.0,
+        "Q_achieved_kW": Q_ach/1000.0,
+        "Q_sensible_est_kW": (mdot_da*cp_a*(Tdb_in - T_out))/1000.0,
         "Air_out_DB_C": T_out,
         "Air_out_WB_C": WB_out,
         "Air_out_RH_pct": RH_out,
-        "Rows_used": (rows_log[-1]["row"] if rows_log else 0),
-        "Segments_logged": len(rows_log),
+        "Rows_used": len(rows_log),
+        "Rows_required": (len(rows_log) if Q_total >= Q_required - 1e-6 else float('nan')),
         "Insufficiency": "None" if not insuff else ", ".join(insuff),
         "Tsat_C": Tsat_C,
         "SH_req_K": SH_req_K,
         "SH_ach_K": SH_ach,
         "x_in": x_in,
+        "x_end_backward": (x if x is not None else None),
         "Ao_total_m2": Ao,
         "A_fin_total_m2": geom.get('A_fin'),
         "A_bare_total_m2": geom.get('A_bare'),
@@ -740,7 +678,7 @@ def build_pdf(inputs_dict, rows_df, summary_dict) -> bytes:
     else:
         df2 = rows_df.copy()
         # limit columns to readable set
-        cols = [c for c in ["row","seg","regime","wet","Q_kW","T_air_out","W_air_out","T_ref","x","frac_used","UA_used","Re_i","v_ref"] if c in df2.columns]
+        cols = [c for c in ["row","regime","Q_row_kW","T_air_out","W_air_out","T_ref","x","frac_used","UA","Re_i","v_ref"] if c in df2.columns]
         df2 = df2[cols]
         data = [cols] + df2.round(4).values.tolist()
         tz = Table(data, repeatRows=1)
