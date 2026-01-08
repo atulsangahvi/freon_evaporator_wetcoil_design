@@ -436,10 +436,10 @@ T_ref = Tsat_C + SH_req_K
 
 
     # helpers for saturated air at a given surface temp
-    def sat_props_at_Ts(Ts_C: float):
-        W_s = W_from_T_RH(Ts_C, 100.0)
-        h_s = h_moist_J_per_kg_da(Ts_C, W_s)
-        return W_s, h_s
+def sat_props_at_Ts(Ts_C: float):
+    W_s = W_from_T_RH(Ts_C, 100.0)
+    h_s = h_moist_J_per_kg_da(Ts_C, W_s)
+    return W_s, h_s
 
     rows_log = []
     Q_total = 0.0
